@@ -7,6 +7,9 @@
  *
  * Auto-launched by the MCP server if not already running.
  * Run directly: bun broker.ts
+ *
+ * Every read/write endpoint requires the shared token (see shared/auth.ts).
+ * Only /health is unauthenticated, and it is a bare liveness check.
  */
 
 import { Database } from "bun:sqlite";
@@ -22,9 +25,11 @@ import type {
   Peer,
   Message,
 } from "./shared/types.ts";
+import { getOrCreateToken, TOKEN_HEADER } from "./shared/auth.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const TOKEN = getOrCreateToken();
 
 // --- Database setup ---
 
@@ -57,6 +62,11 @@ db.run(`
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// Truncate the WAL on startup so it does not grow unbounded across long-lived
+// daemon runs. Combined with delete-on-delivery below, this keeps the on-disk
+// database from accumulating plaintext peer summaries and message history.
+db.run("PRAGMA wal_checkpoint(TRUNCATE)");
 
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
@@ -118,8 +128,10 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+// Messages are deliver-once. Remove them on delivery rather than marking them,
+// so message text does not sit in the database (and the WAL) indefinitely.
+const deleteMessage = db.prepare(`
+  DELETE FROM messages WHERE id = ?
 `);
 
 // --- Generate peer ID ---
@@ -211,9 +223,9 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
 
-  // Mark them as delivered
+  // Deliver-once: remove each message as it is handed to the recipient.
   for (const msg of messages) {
-    markDelivered.run(msg.id);
+    deleteMessage.run(msg.id);
   }
 
   return { messages };
@@ -234,9 +246,18 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        // Unauthenticated liveness check only — deliberately reveals nothing
+        // about how many sessions are running or what they are doing.
+        return Response.json({ status: "ok" });
       }
       return new Response("claude-peers broker", { status: 200 });
+    }
+
+    // Every read/write endpoint requires the shared token. This is what stops
+    // any other local process from registering peers, reading the peer list,
+    // or injecting messages into a Claude session.
+    if (req.headers.get(TOKEN_HEADER) !== TOKEN) {
+      return Response.json({ error: "unauthorized" }, { status: 401 });
     }
 
     try {
@@ -270,4 +291,6 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(
+  `[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH}, token auth enabled)`
+);

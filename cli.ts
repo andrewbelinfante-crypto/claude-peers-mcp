@@ -11,14 +11,17 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
+import { getOrCreateToken, TOKEN_HEADER } from "./shared/auth.ts";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const TOKEN = getOrCreateToken();
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
     ? {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", [TOKEN_HEADER]: TOKEN },
         body: JSON.stringify(body),
       }
     : {};
@@ -32,32 +35,32 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+type PeerRow = {
+  id: string;
+  pid: number;
+  cwd: string;
+  git_root: string | null;
+  tty: string | null;
+  summary: string;
+  last_seen: string;
+};
+
 const cmd = process.argv[2];
 
 switch (cmd) {
   case "status": {
     try {
-      const health = await brokerFetch<{ status: string; peers: number }>("/health");
-      console.log(`Broker: ${health.status} (${health.peers} peer(s) registered)`);
+      const health = await brokerFetch<{ status: string }>("/health");
+      const peers = await brokerFetch<PeerRow[]>("/list-peers", {
+        scope: "machine",
+        cwd: "/",
+        git_root: null,
+      });
+
+      console.log(`Broker: ${health.status} (${peers.length} peer(s) registered)`);
       console.log(`URL: ${BROKER_URL}`);
 
-      if (health.peers > 0) {
-        const peers = await brokerFetch<
-          Array<{
-            id: string;
-            pid: number;
-            cwd: string;
-            git_root: string | null;
-            tty: string | null;
-            summary: string;
-            last_seen: string;
-          }>
-        >("/list-peers", {
-          scope: "machine",
-          cwd: "/",
-          git_root: null,
-        });
-
+      if (peers.length > 0) {
         console.log("\nPeers:");
         for (const p of peers) {
           console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
@@ -74,17 +77,7 @@ switch (cmd) {
 
   case "peers": {
     try {
-      const peers = await brokerFetch<
-        Array<{
-          id: string;
-          pid: number;
-          cwd: string;
-          git_root: string | null;
-          tty: string | null;
-          summary: string;
-          last_seen: string;
-        }>
-      >("/list-peers", {
+      const peers = await brokerFetch<PeerRow[]>("/list-peers", {
         scope: "machine",
         cwd: "/",
         git_root: null,
@@ -131,8 +124,8 @@ switch (cmd) {
 
   case "kill-broker": {
     try {
-      const health = await brokerFetch<{ status: string; peers: number }>("/health");
-      console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
+      await brokerFetch<{ status: string }>("/health");
+      console.log("Broker is running. Shutting down...");
       // Find and kill the broker process on the port
       const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
       const pids = new TextDecoder()
