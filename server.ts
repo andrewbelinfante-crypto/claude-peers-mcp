@@ -330,6 +330,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "send_message": {
       const { to_id, message } = args as { to_id: string; message: string };
+      if (typeof to_id !== "string" || to_id.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "send_message requires a non-empty string `to_id` (the recipient peer ID from list_peers). Call get_my_id or list_peers to obtain a valid ID.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (typeof message !== "string" || message.length === 0) {
+        return {
+          content: [
+            { type: "text" as const, text: "send_message requires a non-empty string `message`." },
+          ],
+          isError: true,
+        };
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
