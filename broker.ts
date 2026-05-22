@@ -85,6 +85,11 @@ function cleanStalePeers() {
 
 cleanStalePeers();
 
+// Sweep any pre-refactor messages left in the legacy delivered=1 state. The
+// current delivery path deletes on read, but rows written before that change
+// have no other cleanup route.
+db.run("DELETE FROM messages WHERE delivered = 1");
+
 // Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
 
@@ -151,9 +156,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
 
-  // Remove any existing registration for this PID (re-registration)
+  // Remove any existing registration for this PID (re-registration).
+  // Reassign any pending messages addressed to the prior ID; they were meant
+  // for "this session," not for that specific ID, so they should land on the
+  // new registration rather than being orphaned.
   const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
   if (existing) {
+    db.run("UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0", [id, existing.id]);
     deletePeer.run(existing.id);
   }
 

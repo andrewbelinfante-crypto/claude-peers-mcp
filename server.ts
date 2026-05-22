@@ -44,7 +44,7 @@ const TOKEN = getOrCreateToken();
 
 // --- Broker communication ---
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetchOnce<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", [TOKEN_HEADER]: TOKEN },
@@ -55,6 +55,21 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
   }
   return res.json() as Promise<T>;
+}
+
+// Single retry with ~200ms backoff on thrown (network-level) errors only.
+// We deliberately do not retry on ok:false payloads; those are persistent
+// application errors ("Peer X not found"), and retrying would amplify them.
+// Tradeoff: if the broker received the request and inserted the message but
+// the response was lost, this will produce a duplicate. Accepted in lieu of
+// silent message loss; revisit with an idempotency key if duplicates surface.
+async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  try {
+    return await brokerFetchOnce<T>(path, body);
+  } catch {
+    await new Promise((r) => setTimeout(r, 200));
+    return await brokerFetchOnce<T>(path, body);
+  }
 }
 
 async function isBrokerAlive(): Promise<boolean> {
@@ -98,6 +113,14 @@ async function ensureBroker(): Promise<void> {
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
   console.error(`[claude-peers] ${msg}`);
+}
+
+function abbreviateHome(path: string): string {
+  const home = process.env.HOME;
+  if (!home) return path;
+  if (path === home) return "~";
+  if (path.startsWith(home + "/")) return "~" + path.slice(home.length);
+  return path;
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
@@ -224,6 +247,15 @@ const TOOLS = [
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "get_my_id",
+    description:
+      "Return this session's own peer ID. Useful for self-introspection, debugging from inside a session, or sharing your ID with a peer as a fallback when they cannot see you via list_peers.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -396,6 +428,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "get_my_id": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: myId }],
+      };
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -422,7 +466,7 @@ async function pollAndPushMessages() {
         const sender = peers.find((p) => p.id === msg.from_id);
         if (sender) {
           fromSummary = sender.summary;
-          fromCwd = sender.cwd;
+          fromCwd = abbreviateHome(sender.cwd);
         }
       } catch {
         // Non-critical, proceed without sender info
