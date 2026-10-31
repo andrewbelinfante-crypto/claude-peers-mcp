@@ -141,6 +141,25 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   return null;
 }
 
+// The Claude desktop app starts MCP servers from the main checkout, so
+// process.cwd() is wrong for a session in a worktree. The session process
+// that spawned this server holds the real folder; fall back to our own cwd.
+function getSessionCwd(): string {
+  try {
+    const proc = Bun.spawnSync([
+      "lsof", "-a", "-p", String(process.ppid), "-d", "cwd", "-Fn",
+    ]);
+    const line = new TextDecoder()
+      .decode(proc.stdout)
+      .split("\n")
+      .find((l) => l.startsWith("n/"));
+    if (line) return line.slice(1);
+  } catch {
+    // ignore
+  }
+  return process.cwd();
+}
+
 function getTty(): string | null {
   try {
     // Try to get the parent's tty from the process tree
@@ -520,7 +539,7 @@ async function main() {
   await ensureBroker();
 
   // 2. Gather context
-  myCwd = process.cwd();
+  myCwd = getSessionCwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
 
